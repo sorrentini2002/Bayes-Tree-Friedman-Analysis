@@ -1,0 +1,897 @@
+---
+title: "HW1"
+author: "Emidio Grillo, Alessandro Querqui and Matteo Sorrentini"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Part 1
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Load the packages
+library(rpart)
+library(MASS)
+library(ggplot2) 
+library(pROC)
+library(broom)
+library(kableExtra)
+set.seed(123)
+```
+
+#### Introduction
+
+In this homework we simulate data for a binary classification problem where:
+
+-   $X \mid Y=0 \sim \text{Uniform}(-3,1)$
+
+-   $X \mid Y=1 \sim \text{Uniform}(-1,3)$
+
+The theoretical Bayes classifier is computed as: $$
+r(x) = P(Y=1 \mid X=x) = \frac{f_1(x)}{f_0(x) + f_1(x)}
+$$ where $f_0(x)$ and $f_1(x)$ are the densities of the respective uniform distributions.
+
+We will split the data into training (60%), validation (20%) and test (20%) sets. A decision tree classifier is tuned on the training and validation sets, and its performance is compared on the test set with the theoretical Bayes classifier.
+
+#### Step 1: Data Generation
+
+Below we generate the simulated data according to the specifications.
+
+```{r data-generation, echo=TRUE}
+# Define the number of observations
+n <- 1000
+
+# Set probability for Y = 1 (implying P(Y = 0) = 0.5 as well)
+p_y1 <- 0.5
+
+# Generate binary outcome Y ~ Bernoulli(0.5) as a Binomial with 1 trial
+Y <- rbinom(n, 1, p_y1)
+
+# Initialize X vector, which will store the predictor values
+X <- rep(NA, n)
+
+# Generate X based on the value of Y:
+# If Y equals 0, take X from a Uniform(-3, 1)
+# If Y equals 1, take X from a Uniform(-1, 3)
+for (i in 1:n) {
+  if (Y[i] == 0) {
+    X[i] <- runif(1, min = -3, max = 1)
+  } else {
+    X[i] <- runif(1, min = -1, max = 3)
+  }
+}
+
+# Combination of the generated values into a data frame
+data <- data.frame(Y = Y, X = X)
+
+```
+
+#### Step 2: Definition and Plotting of the Theoretical Bayes Classifier
+
+In this step, we define the function $r(x)$ that computes the conditional probability $P(Y = 1 \mid X = x)$. This function represents the theoretical Bayes classifier based on the densities of the two uniform distributions. We then plot this function along with the data points to visualize the decision boundary.
+
+```{r bayes-classifier, echo=TRUE}
+# Define the function r_x(x) to compute P(Y = 1 | X = x)
+r_x <- function(x) {
+  # Density for X given Y = 0: Uniform(-3, 1)
+  f0_x <- dunif(x, -3, 1)
+  # Density for X given Y = 1: Uniform(-1, 3)
+  f1_x <- dunif(x, -1, 3)
+  # Return the conditional probability using Bayes' formula
+  return(f1_x / (f0_x + f1_x))
+}
+
+# Plot of the data points (blue) with X on the horizontal axis and Y on the vertical axis
+plot(data$X, data$Y, pch = 16, col = "blue",
+     main = "Data and Theoretical r(x) Function",
+     xlab = "X", ylab = "Y")
+
+# Overlay the theoretical Bayes classifier function as a red dashed line
+curve(r_x(x), add = TRUE, col = "red", lwd = 2, lty = 2)
+```
+
+#### Step 3: Bayes Classifier Prediction (Full Data)
+
+In this step, we compute the predictions using the theoretical Bayes classifier on the full data-set and calculate the accuracy. We use a threshold of 0.5, meaning that if $r(x) > 0.5$ we predict class 1, otherwise we predict class 0.
+
+```{r bayes-prediction, echo=TRUE}
+# Use threshold 0.5: if r(x) > 0.5, predict 1; otherwise, predict 0
+bayes_pred <- ifelse(r_x(X) > 0.5, 1, 0)
+
+# Calculate overall accuracy on the full dataset (for illustration purposes)
+bayes_accuracy_full <- mean(bayes_pred == Y)
+cat("Bayes Classifier Accuracy (full data):", round(bayes_accuracy_full, 4), "\n")
+```
+
+#### Step 4: Data Splitting
+
+In this step, we randomly split the data-set into three subsets: - **Training set (60%)**: Used to fit the model. - **Validation set (20%)**: Used for tuning model parameters. - **Test set (20%)**: Used to evaluate the final model performance.
+
+This approach helps to prevent over-fitting and provides a realistic estimate of model performance on unseen data.
+
+```{r data-split, echo=TRUE}
+# Shuffle the indices for random splitting
+indices <- sample(1:n, n)
+
+# Define the sizes for each set
+n_train <- round(0.6 * n)
+n_val   <- round(0.2 * n)
+
+# Split the indices into training, validation, and test sets
+train_idx <- indices[1:n_train]
+val_idx   <- indices[(n_train + 1):(n_train + n_val)]
+test_idx  <- indices[(n_train + n_val + 1):n]
+
+# Create data frames for each subset
+train_data <- data[train_idx, ]
+val_data   <- data[val_idx, ]
+test_data  <- data[test_idx, ]
+```
+
+#### Step 5: Decision Tree Classifier Tuning
+
+In this step, we train a decision tree classifier using the `rpart` package on the training set and tune its maximum depth by evaluating performance on the validation set. We iterate over a range of `maxdepth` values, compute the validation accuracy for each model, and then select the `maxdepth` that yields the highest accuracy.
+
+Tuning the depth of the tree is crucial to **prevent over-fitting**. If the tree is too deep, it may capture noise in the training data rather than the true underlying pattern, leading to poor generalization on unseen data. By selecting the optimal depth based on validation accuracy, we ensure a balance between model complexity and predictive performance.
+
+```{r decision-tree-tuning, echo=TRUE, warning=FALSE, message=FALSE}
+# Define a range of maxdepth values to test (from 1 to 5)
+maxdepth_values <- 1:5
+val_accuracies <- numeric(length(maxdepth_values))
+trees <- list()
+
+# Loop over the possible maxdepth values to tune the decision tree
+for (i in seq_along(maxdepth_values)) {
+  # Train a decision tree with the current maxdepth on the training set
+  tree_model <- rpart(Y ~ X, data = train_data, method = "class",
+                      control = rpart.control(maxdepth = maxdepth_values[i], cp = 0))
+  trees[[i]] <- tree_model
+  
+  # Predict on the validation set using the current decision tree model
+  val_pred <- predict(tree_model, newdata = val_data, type = "class")
+  
+  # Compute and store the validation accuracy
+  val_accuracies[i] <- mean(val_pred == val_data$Y)
+  cat("Maxdepth:", maxdepth_values[i], "Validation Accuracy:", round(val_accuracies[i], 4), "\n")
+}
+
+# Identify the best maxdepth based on the highest validation accuracy
+best_index <- which.max(val_accuracies)
+best_maxdepth <- maxdepth_values[best_index]
+cat("Best maxdepth selected:", best_maxdepth, "\n")
+```
+
+#### Step 6: Final Model Training and Evaluation on the Test Set
+
+In this step, we combine the training and validation sets to train a final decision tree classifier using the optimal `maxdepth` determined earlier. We then evaluate the performance of this final model on the test set. For comparison, we also compute the predictions and accuracy of the theoretical Bayes classifier on the same test set.
+
+```{r final-evaluation, echo=TRUE, warning=FALSE, message=FALSE}
+# Combine training and validation sets for final model training
+train_val_data <- rbind(train_data, val_data)
+
+# Train the final decision tree using the optimal maxdepth selected from tuning
+final_tree <- rpart(Y ~ X, data = train_val_data, method = "class",
+                    control = rpart.control(maxdepth = best_maxdepth, cp = 0))
+
+# Predict on the test set using the final decision tree model
+tree_test_pred <- predict(final_tree, newdata = test_data, type = "class")
+tree_test_accuracy <- mean(tree_test_pred == test_data$Y)
+cat("Decision Tree Test Accuracy:", round(tree_test_accuracy, 4), "\n")
+
+# Predict on the test set using the theoretical Bayes classifier
+bayes_test_pred <- ifelse(r_x(test_data$X) > 0.5, 1, 0)
+bayes_test_accuracy <- mean(bayes_test_pred == test_data$Y)
+cat("Bayes Classifier Test Accuracy:", round(bayes_test_accuracy, 4), "\n")
+```
+
+#### Step 7: Monte Carlo Simulation for Model Performance Evaluation
+
+In this step, we conduct a Monte Carlo simulation by repeating the entire data generation and classification process multiple times. This allows us to assess the stability and average performance of both the Bayes classifier and the decision tree classifier.
+
+Instead of evaluating performance on a **single data-set**, we generate **M = 10,000** different data-sets, each with $n = 1000$ observations. We then train and evaluate both classifiers on each data-set, computing their average accuracy and variability.
+
+By analyzing the results, we can determine which model performs better **on average** and whether one method is consistently superior.
+
+```{r monte-carlo-simulation, echo=TRUE, warning=FALSE, message=FALSE}
+# Number of repetitions for Monte Carlo simulation
+M <- 10000
+
+# Vectors to store accuracy results for both classifiers
+bayes_accuracies <- numeric(M)
+tree_accuracies  <- numeric(M)
+
+# Monte Carlo loop
+for (m in 1:M) {
+  
+  # Generate new dataset
+  Y <- rbinom(n, 1, p_y1)
+  X <- rep(NA, n)
+  
+  for (i in 1:n) {
+    if (Y[i] == 0) {
+      X[i] <- runif(1, min = -3, max = 1)
+    } else {
+      X[i] <- runif(1, min = -1, max = 3)
+    }
+  }
+  
+  # Compute Bayes classifier predictions
+  bayes_pred <- ifelse(r_x(X) > 0.5, 1, 0)
+  bayes_accuracies[m] <- mean(bayes_pred == Y)
+  
+  # Train decision tree on generated data
+  data_m <- data.frame(Y = Y, X = X)
+  tree_model_m <- rpart(Y ~ X, data = data_m, method = "class",
+                        control = rpart.control(maxdepth = best_maxdepth, cp = 0))
+  
+  # Predict using the trained decision tree
+  tree_pred_m <- predict(tree_model_m, newdata = data_m, type = "class")
+  tree_accuracies[m] <- mean(tree_pred_m == Y)
+}
+
+# Compute mean accuracy and standard deviation for both classifiers
+mean_bayes_accuracy <- mean(bayes_accuracies)
+sd_bayes_accuracy   <- sd(bayes_accuracies)
+mean_tree_accuracy  <- mean(tree_accuracies)
+sd_tree_accuracy    <- sd(tree_accuracies)
+
+# Print results
+cat("Bayes Classifier - Mean Accuracy:", round(mean_bayes_accuracy, 4), 
+    " | Standard Deviation:", round(sd_bayes_accuracy, 4), "\n")
+cat("Decision Tree - Mean Accuracy:", round(mean_tree_accuracy, 4), 
+    " | Standard Deviation:", round(sd_tree_accuracy, 4), "\n")
+```
+
+#### Step 9: Conclusion and Discussion of Results
+
+After running the Monte Carlo simulation with 10,000 repetitions, we obtained the following results for the average accuracy and variability of the two classifiers:
+
+-   **Bayes Classifier**:
+    -   Mean Accuracy: `r round(mean_bayes_accuracy, 4)`
+    -   Standard Deviation: `r round(sd_bayes_accuracy, 4)`
+-   **Decision Tree**:
+    -   Mean Accuracy: `r round(mean_tree_accuracy, 4)`
+    -   Standard Deviation: `r round(sd_tree_accuracy, 4)`
+
+#### Observations and Interpretation
+
+1.  **Unexpected Result**: The Decision Tree classifier achieved a slightly higher mean accuracy (`r round(mean_tree_accuracy, 4)`) compared to the Bayes classifier (`r round(mean_bayes_accuracy, 4)`), which is theoretically optimal. This result may seem counterintuitive at first glance, but it can be explained by several factors:
+
+    -   **Nature of the Data**: The simulated data comes from two overlapping uniform distributions. While the Bayes classifier is derived from the true underlying distribution, the decision boundary it defines might not perfectly align with the structure of the data due to slight numerical or sampling fluctuations.
+
+    -   **Flexibility of the Decision Tree**: The Decision Tree classifier, despite being a practical model, has the ability to adapt flexibly to the specific patterns in the data. In this case, it appears that the tree's piecewise-linear decision boundaries better approximate the true decision boundary, leading to slightly better performance on average.
+
+2.  **Stability of Performance**: The standard deviation of the Decision Tree's accuracy (`r round(sd_tree_accuracy, 4)`) is lower than that of the Bayes classifier (`r round(sd_bayes_accuracy, 4)`), indicating that the tree performs more consistently across different datasets. This suggests that the Decision Tree is less sensitive to small variations in the data.
+
+3.  **Practical vs Theoretical Optimality**: The Bayes classifier represents the theoretical optimum, but its performance depends on the exact specification of the underlying distributions. In practice, models like the Decision Tree can outperform the Bayes classifier if they better capture the nuances of the data, even if they are not theoretically optimal.
+
+#### Final Remarks
+
+The results of this analysis highlight an important lesson in machine learning: while theoretical benchmarks like the Bayes classifier provide valuable insights, practical models such as the Decision Tree can sometimes achieve superior performance on real or simulated data due to their flexibility and robustness.
+
+In conclusion the **Decision Tree** emerges as the best classifier in terms of mean accuracy and stability in this specific setting. This outcome underscores the importance of empirical evaluation and repeated sampling when comparing classifiers, as theoretical optimal does not always translate directly into superior practical performance.
+
+## Warm-up
+
+#### PSEUDO-CODE of the algorithm Two_Sample_Test:
+
+#### INPUT:
+
+```         
+X = {x₁, ..., xₙ}      |  First sample
+Z = {z₁, ..., zₘ}      |  Second sample
+P                     |  Number of permutations
+C                     |  Classifier type
+T                     |  Chosen baseline test(e.g. Mann-Whitney test, Kolmogorov-Smirnov test)
+```
+
+### PROCEDURE:
+
+#### 1. Data Preparation
+
+```         
+U = X ∪ Z                      | Merge the two samples
+Y = [+1,...,+1,-1,...,-1]      | n times +1, m times -1
+```
+
+#### 2. Original Training
+
+```         
+F = Train_Classifier(C, U, Y)
+S = Compute_Score(F, U)
+t₀ = Apply_Test(T, S[1:n], S[n+1:n+m])      | S[1:n]is S+ , S[n+1:n+m]is S-
+```
+
+#### 3. Null Distribution Computation
+
+```         
+H₀ = empty list
+REPEAT P times:
+    Y_perm = Randomly_Permute(Y)
+    F_perm = Train_Classifier(M, U, Y_perm)
+    S_perm = Compute_Score(F_perm, U)
+    t_perm = Apply_Test(T, S_perm[1:n], S_perm[n+1:n+m])
+    Append t_perm to H₀
+```
+
+#### 4. Evaluate significance
+
+```         
+IF (observed test statistic t₀ is in the extreme tail of H₀):
+    - REJECT the null hypothesis (p ≠ q)
+ELSE:
+    - FAIL TO REJECT the null hypothesis (insufficient evidence that p ≠ q)
+```
+
+#### OUTPUT:
+
+```         
+Rejection/Acceptance of the null hypothesis
+t₀       | original test statistic
+H₀       | null distribution
+```
+
+#### Why Mann-Whitney or Kolmogorov-Smirnov as Baseline Tests?
+
+Friedman suggests using the Mann-Whitney test or the Kolmogorov-Smirnov test as baseline methods for comparing the score distributions $S^+$ and $S^-$ because both are non-parametric and do not assume any specific data distribution. The Mann-Whitney test is particularly effective for detecting differences in central tendency between two distributions, while the Kolmogorov-Smirnov test measures the maximum discrepancy between their cumulative distribution functions, making it suitable for identifying differences in shape, location, and scale. These tests are well-established, statistically robust, and efficient, ensuring reliable detection of distributional differences even with moderate sample sizes. Their simplicity and interpretability make them strong foundations for Friedman's machine-learning-based approach.
+
+## Part 2
+
+In the second part, the Friedman procedure was analyzed as applied to a binary classifier, specifically logistic regression. The aim was to study the test's size and power across different scenarios, varying parameters such as sample size, the number of variables, and the distance between the distributions of the two classes.
+
+#### Simulation Parameters
+
+The simulation setup began by defining the following parameters:
+
+-   The number of iterations for the subsequent Monte Carlo simulation, set to 1000. This value, as supported by the literature, is considered sufficient to initialize a study that accurately represents real-world conditions.
+
+-   The number of permutations applied within the Friedman procedure to estimate the empirical distribution under the null hypothesis, $H_0$.
+
+-   The significance level, $\alpha$, which defines the cutoff point for the null hypothesis distribution. Values exceeding this threshold lead to the rejection of $H_0$.
+
+```{r}
+M <- 1000      # Number of iterations  
+P <- 100       # Number of permutations  
+alpha <- 0.05  # Significance level
+```
+
+#### Data Generation
+
+The `generate_data` function generates data based on $F_0()$and $F_1()$: specifically, two multivariate normal distributions of dimension $k$ were chosen, as they are commonly used in statistical tests, and logistic regression is an effective classifier for normally distributed data. Another key aspect is the ability to differentiate between the two distributions by modifying a parameter (in this case, $\mu_1$ is changed while keeping the variances constant and equal to one).
+
+```{r}
+generate_data <- function(n0, n1, k, delta) { mu0 <- rep(0, k) # mean of F_0
+mu1 <- rep(delta, k) # mean of F_1
+Sigma <- diag(k) # identity matrix representing the variance-covariance matrix
+data0 <- mvrnorm(n0, mu0, Sigma) # for each observation, generate k elements from a normal distribution --> as many as the selected predictor variables
+data1 <- mvrnorm(n1, mu1, Sigma)
+data <- rbind(data0, data1) # combine the generated observations into a single dataset
+labels <- c(rep(0, n0), rep(1, n1)) # store the label for each observation in a variable
+return(list(data = data, labels = labels))
+}
+```
+
+#### **Friedman Test**
+
+Next, the Friedman test is applied following the steps outlined in the previous section. Logistic regression was chosen as the binary classifier, with the outcome given by the true labels and the predictors by the $k$ variables generated in the previous step. For each observation, the observed *sigmoid* score is calculated in order to generate the test statistic value $\hat{t}_0$ based on the *Kolmogorov-Smirnov* test, with the goal of quantifying how much the distributions, which generated data with different labels, diverge from each other.
+
+```{r}
+friedman_test <- function(data, labels, P) {
+  model <- glm(labels ~ ., data = as.data.frame(data), family = binomial) # apply logistic regression model using glm function  
+  scores <- predict(model, type = "response") # compute the score predictions  
+  scores0 <- scores[labels == 0] # separate the scores based on the labels  
+  scores1 <- scores[labels == 1]  
+  observed_stat <- ks.test(scores0, scores1)$statistic # calculate the observed Kolmogorov-Smirnov test statistic  
+  
+  perm_stats <- replicate(P, {  
+    perm_labels <- sample(labels) # shuffle the labels  
+    perm_model <- glm(perm_labels ~ ., data = as.data.frame(data), family = binomial) # apply regression model to shuffled labels  
+    perm_scores <- predict(perm_model, type = "response")  
+    perm_scores0 <- perm_scores[perm_labels == 0]  
+    perm_scores1 <- perm_scores[perm_labels == 1]  
+    ks.test(perm_scores0, perm_scores1)$statistic # calculate the Kolmogorov-Smirnov test statistic for the permuted data  
+  })  
+  
+  critical_value <- quantile(perm_stats, probs = 1 - alpha) # calculate the critical value based on the permutation statistics  
+  return(observed_stat > critical_value) # compare the observed statistic with the critical value to reject H0  
+}  
+```
+
+To compare the value of $\hat{t}_0$, the `perm_stat` function was created to simulate a distribution of the test statistic under the null hypothesis $H_0$, where no differences are observed between the distributions of different labels. To achieve this, the true labels were shuffled $p$ times, and for each iteration, a regression model was estimated, and the corresponding value of $\hat{t}_p$ was calculated.
+
+In the final step, the original value of the test statistic was compared within this empirical distribution to determine whether to reject the null hypothesis $H_0$.
+
+**Simulation**
+
+A function is defined to estimate the power by applying the functions created in the previous steps.
+
+```{r}
+simulate <- function(n0, n1, k, delta) {
+  results <- replicate(M, {
+    data <- generate_data(n0, n1, k, delta)
+    friedman_test(data$data, data$labels, P)
+  })
+  return(mean(results))
+}
+```
+
+#### **Simulation Results**
+
+To observe the behavior of the power function as the distance between distributions changes under different scenarios, the following comparisons were made:
+
+-   Data were generated with two different values of delta: $\delta = 0.5$ and $\delta = 0.3$.
+
+-   The number of predictors $k$ varies between 1 and 5.
+
+-   The sample size varies between $n_0 = n_1 = 10$ and $n_0 = n_1 = 50$. Balanced sample sizes were chosen because no significant differences were observed with unbalanced sample sizes.
+
+```{r warning=FALSE}
+n_values = c(10, 20, 30, 40, 50)
+k_values = c(1, 2, 3, 4, 5)
+
+# k = 1 -------------------------------------------------------------------
+
+k = 1
+
+delta = .5
+results <- sapply(n_values, function(n) {
+  simulate(n0 = n, n1 = n, k = k, delta = delta)
+})
+
+delta = .3
+results1 <- sapply(n_values, function(n) {
+  simulate(n0 = n, n1 = n, k = k, delta = delta)
+})
+
+# k = 5 -------------------------------------------------------------------
+
+k = 5
+
+delta = .5
+results2 <- sapply(n_values, function(n) {
+  simulate(n0 = n, n1 = n, k = k, delta = delta)
+})
+
+delta = .3
+results3 <- sapply(n_values, function(n) {
+  simulate(n0 = n, n1 = n, k = k, delta = delta)
+})
+
+# n0 = n1 = 10 ------------------------------------------------------------
+
+n0 = 10
+n1 = 10
+
+delta = .5
+results4 <- sapply(k_values, function(k) {
+  simulate(n0 = n0, n1 = n1, k = k, delta = delta)
+})
+
+delta = .3
+results5 <- sapply(k_values, function(k) {
+  simulate(n0 = n0, n1 = n1, k = k, delta = delta)
+})
+
+# n0 = n1 = 50 ------------------------------------------------------------
+
+n0 = 50
+n1 = 50
+
+delta = .5
+results6 <- sapply(k_values, function(k) {
+  simulate(n0 = n0, n1 = n1, k = k, delta = delta)
+})
+
+delta = .3
+results7 <- sapply(k_values, function(k) {
+  simulate(n0 = n0, n1 = n1, k = k, delta = delta)
+})
+```
+
+Based on these simulations, the behavior of the test's power was compared when $F_0()$ *and* $F_1()$ are more or less similar (i.e., when the delta value is larger or smaller), summarizing the work through the following graphs.
+
+```{r warning=FALSE}
+
+# k = 1 -------------------------------------------------------------------
+
+data_for_plot1 <- data.frame(
+  n = rep(n_values, 2),  
+  delta = rep(c(1, 0.3), each = length(n_values)), 
+  power = c(results, results1) 
+)
+
+ggplot(data_for_plot1, aes(x = n, y = power, color = factor(delta), linetype = factor(delta))) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  labs(
+    title = "Comparison of Test Power by Sample Size (n) and k = 1",
+    x = "Sample Size (n)",
+    y = "Test Power",
+    color = "Delta",
+    linetype = "Delta"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("1" = "blue", "0.3" = "red")) +
+  scale_linetype_manual(values = c("1" = "solid", "0.3" = "dashed"))
+
+# k = 5 -------------------------------------------------------------------
+
+data_for_plot2 <- data.frame(
+  n = rep(n_values, 2),  
+  delta = rep(c(1, 0.3), each = length(n_values)), 
+  power = c(results2, results3) 
+)
+
+ggplot(data_for_plot2, aes(x = n, y = power, color = factor(delta), linetype = factor(delta))) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  labs(
+    title = "Comparison of Test Power by Sample Size (n) and k = 5",
+    x = "Sample Size (n)",
+    y = "Test Power",
+    color = "Delta",
+    linetype = "Delta"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("1" = "blue", "0.3" = "red")) +
+  scale_linetype_manual(values = c("1" = "solid", "0.3" = "dashed")) 
+
+# n0 = n1 = 10 ------------------------------------------------------------
+
+data_for_plot3 <- data.frame(
+  k = rep(k_values, 2),  
+  delta = rep(c(1, 0.3), each = length(k_values)),  
+  power = c(results4, results5)  
+)
+
+ggplot(data_for_plot3, aes(x = k, y = power, color = factor(delta), linetype = factor(delta))) +
+  geom_line(size = 1) + 
+  geom_point(size = 3) +  
+  labs(
+    title = "Comparison of Test Power by Number of Features (k) and Sample size of 10",
+    x = "Number of Features (k)",
+    y = "Test Power",
+    color = "Delta",
+    linetype = "Delta"
+  ) +
+  theme_minimal() +  
+  scale_color_manual(values = c("1" = "blue", "0.3" = "red")) + 
+  scale_linetype_manual(values = c("1" = "solid", "0.3" = "dashed")) 
+
+# n0 = n1 = 50 ------------------------------------------------------------
+
+data_for_plot4 <- data.frame(
+  k = rep(k_values, 2),  
+  delta = rep(c(1, 0.3), each = length(k_values)),  
+  power = c(results6, results7)  
+)
+
+ggplot(data_for_plot4, aes(x = k, y = power, color = factor(delta), linetype = factor(delta))) +
+  geom_line(size = 1) + 
+  geom_point(size = 3) +  
+  labs(
+    title = "Comparison of Test Power by Number of Features (k) and Sample size of 50",
+    x = "Number of Features (k)",
+    y = "Test Power",
+    color = "Delta",
+    linetype = "Delta"
+  ) +
+  theme_minimal() +  
+  scale_color_manual(values = c("1" = "blue", "0.3" = "red")) + 
+  scale_linetype_manual(values = c("1" = "solid", "0.3" = "dashed"))
+```
+
+Finally, the test size was calculated in extreme cases among those analyzed, yielding the following results:
+
+```{r warning=FALSE}
+n0 = 10
+n1 = 10
+k = 1
+size1 <- simulate(n0, n1, k, delta = 0)
+
+n0 = 10
+n1 = 10
+k = 5
+size2 <- simulate(n0, n1, k, delta = 0)
+
+n0 = 50
+n1 = 50
+k = 1
+size3 <- simulate(n0, n1, k, delta = 0)
+
+n0 = 50
+n1 = 50
+k = 5
+size4 <- simulate(n0, n1, k, delta = 0)
+
+cat("Simulation Results:\n")
+cat("Sample Size (n0 = n1) = 10, k = 1: Power = ", round(size1, 3), "\n", sep = "")
+cat("Sample Size (n0 = n1) = 10, k = 5: Power = ", round(size2, 3), "\n", sep = "")
+cat("Sample Size (n0 = n1) = 50, k = 1: Power = ", round(size3, 3), "\n", sep = "")
+cat("Sample Size (n0 = n1) = 50, k = 5: Power = ", round(size4, 3), "\n", sep = "")
+```
+
+#### **Conclusions**
+
+The results show that the power of the test increases with both the sample size and the distance between the distributions. When delta is small, the test has less power to reject the null hypothesis. Additionally, the number of variables $k$ significantly affects the test's ability to distinguish between the two distributions.
+
+## **Part 3**
+
+In this analysis, the Friedman procedure is applied to HR (Heart Rate) data to distinguish between effort zones, specifically Zone-2 and Zone-3. The main goal is to identify an appropriate embedding method for data representation and assess the statistical differences between zones using permutation tests.
+
+**Data Preparation**
+
+The data-set contains speed and altitude data, measured at one-second intervals. Each row represents the athlete's activity over a minute, with the overall effort summarized by the categorical variable $y$, which is associated with 60 values for speed and an equal number for altitude.
+
+Summary variables are created to efficiently and comprehensively reduce the large number of values, allowing for an analysis of the contribution of both variables to the construction of the dependent variable $y$.
+
+The variables used in the classifier are as follows:
+
+-   Average speed, which represents the average speed during a minute.
+
+-   Speed standard deviation, which measures the variability of speed.
+
+-   Speed range, which is the difference between the maximum and minimum speed.
+
+-   Average altitude, which is the mean altitude, showing the general altitude level of the activity.
+
+-   Total elevation gain, which is the sum of positive altitude gains, measuring the overall uphill effort.
+
+-   Cumulative speed variation, which is the sum of the absolute speed variations, reflecting the intensity of fluctuations.
+
+-   Average altitude slope, which is the mean variation in altitude, representing the general trend of the terrain (uphill or downhill).
+
+-   Maximum positive and negative slope, which indicates the steepest uphill and downhill gradients, quantifying moments of maximum effort and recovery.
+
+-   Elevation-to-average-speed ratio, which is the ratio between uphill effort and average speed, indicating the athlete's efficiency under inclined conditions.
+
+```{r}
+load("hw_data.RData")
+data = hw
+# Function to calculate the required indices for each row of the dataset
+calculate_features <- function(row_index, data) {
+  # Extract speed and altitude data from the corresponding row in the dataset
+  speed <- as.numeric(data[row_index, 2:61])  # Columns 2-61: speed
+  altitude <- as.numeric(data[row_index, 62:121])  # Columns 62-121: altitude
+  
+  # Calculate the indices
+  features <- list(
+    # Index 1: Average speed
+    mean_speed = mean(speed, na.rm = TRUE),
+    
+    # Index 2: Standard deviation of speed
+    std_speed = sd(speed, na.rm = TRUE),
+    
+    # Index 3: Speed range
+    range_speed = max(speed, na.rm = TRUE) - min(speed, na.rm = TRUE),
+    
+    # Index 4: Average altitude
+    mean_altitude = mean(altitude, na.rm = TRUE),
+    
+    # Index 5: Total elevation gain (positive altitude gain)
+    total_elevation_gain = sum(pmax(diff(altitude), 0), na.rm = TRUE),
+    
+    # Index 6: Cumulative speed variation
+    cumulative_speed_variation = sum(abs(diff(speed)), na.rm = TRUE),
+    
+    # Index 7: Average altitude slope
+    mean_slope = mean(diff(altitude), na.rm = TRUE),
+    
+    # Index 8-9: Maximum positive and negative slope
+    max_positive_slope = max(diff(altitude), na.rm = TRUE),
+    max_negative_slope = min(diff(altitude), na.rm = TRUE),
+    
+    # Index 10: Elevation-to-average-speed ratio
+    elevation_to_speed_ratio = ifelse(mean(speed, na.rm = TRUE) != 0,
+                                      sum(pmax(diff(altitude), 0), na.rm = TRUE) / mean(speed, na.rm = TRUE),
+                                      NA)
+  )
+  
+  return(unlist(features))
+}
+```
+
+The next step is to apply all these indices to each row of the original data-set. Then, a new data-set is created, which includes only these indices and the label for the effort zone.
+
+```{r}
+# Create a matrix containing only the summary indices
+features_matrix <- t(sapply(1:nrow(data), calculate_features, data = data))
+
+# Proceed to create a dataset from the matrix
+features_df <- as.data.frame(features_matrix)
+
+# Add the categorical variable to the newly created dataset
+features_df$y =  data$y
+```
+
+#### **Logistic Regression Classification**
+
+A reduced data-set is created to include only the observations related to effort zones 2 and 3. The label variable is then reclassified into a binary format, where $y = 1$ for `"zone-3`" and $y = 0$ for `"zone-2"`.
+
+```{r}
+
+# Filter the rows to obtain only those with effort zones 2 and 3
+filtered_df <- subset(features_df, y %in% c("Zone-3", "Zone-2"))
+
+# Reclassify the variable y
+filtered_df$y <- ifelse(filtered_df$y == "Zone-3", 1, 0)
+```
+
+As in the previous section, logistic regression is chosen as the binary classifier, using all the previously defined variables as predictors.
+
+```{r message=FALSE, warning=FALSE}
+# Perform logistic regression
+model <- glm(y ~ ., data = filtered_df, family = binomial())
+
+# Display a summary of the regression to study the influence of the predictors on the score function
+model_summary <- tidy(model)
+
+# Create a table with kableExtra
+model_summary %>%
+  kable("html", caption = "Logistic Regression Model Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, color = "blue") %>%
+  column_spec(3, color = "red") %>%
+  column_spec(4, color = "green")
+```
+
+Given the limited relevance of the variables `mean_altitude` and `total_elevation_gain` (it can be observed that they are minimally significant despite the large data-set, with associated coefficients that are practically zero), these variables are removed from the model, which will then be used in the Friedman test to be executed in the following steps.
+
+```{r message=FALSE, warning=FALSE}
+model_updated <- glm(y ~ . - mean_altitude - total_elevation_gain, 
+                     data = filtered_df, family = binomial())
+model_summary <- tidy(model_updated)
+
+# Create a table with kableExtra
+model_summary %>%
+  kable("html", caption = "Logistic Regression Model Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, color = "blue") %>%
+  column_spec(3, color = "red") %>%
+  column_spec(4, color = "green")
+```
+
+To quantify the predictive ability of the model, the McFadden's $R^2$ index is estimated, which ranges from $[0,1]$ and is an adaptation of the regular $R^2$ for logistic regression. A value of 0.25 is considered quite good, as logistic regression models generally explain a smaller portion of the variability compared to linear regression models.
+
+```{r}
+
+# The deviance of the model is calculated, representing the unexplained variability and the total variability of the model
+deviance_null <- model_updated$null.deviance
+deviance_model <- model_updated$deviance
+
+# McFadden's R² is calculated
+r_squared_mcfadden <- 1 - (deviance_model / deviance_null)
+cat("McFadden's R²:", round(r_squared_mcfadden, 4), "\n")
+
+```
+
+#### **Friedman Procedure**
+
+The Friedman procedure is implemented using the functions created in the second part with some adaptations, incorporating the data-set with the summary variables and the classifier just defined.
+
+```{r}
+alpha <- 0.05
+
+friedman_test2 <- function(data, labels, model, P) {
+  scores <- predict(model, type = "response")
+  scores0 <- scores[labels == 0]
+  scores1 <- scores[labels == 1]
+  observed_stat <- ks.test(scores0, scores1)$statistic
+  perm_stats <- replicate(P, {
+    perm_labels <- sample(labels)
+    perm_model <- glm(perm_labels ~ ., data = data, family = binomial)
+    perm_scores <- predict(perm_model, type = "response")
+    perm_scores0 <- perm_scores[perm_labels == 0]
+    perm_scores1 <- perm_scores[perm_labels == 1]
+    ks.test(perm_scores0, perm_scores1)$statistic
+  })
+  critical_value <- quantile(perm_stats, probs = 1 - alpha)
+  return(observed_stat > critical_value)
+}
+
+simulate <- function(data, labels, model, P) {
+  result <- friedman_test2(data, labels, model, P)
+  return(result)
+}
+
+result_friedman <- simulate(filtered_df[, -ncol(filtered_df)], filtered_df$y, model_updated, P = 100)
+
+if (result_friedman) {
+  cat("The test rejected H0: Significant difference between y=0 and y=1.\n")
+} else {
+  cat("The test did not reject H0: No significant difference between y=0 and y=1.\n")
+}
+
+```
+
+In conclusion, the Friedman procedure leads to rejecting the null hypothesis \$H_0\$, and thus, it can be concluded that the effort zones 2 and 3 have significantly different values when observing the created summary variables.
+
+**Graphical Visualization**
+
+To provide an intuitive summary of the data, the following graphs are created to summarize the work done. The first compares the distributions of the average speed between Zone-2 and Zone-3. The two distributions are not clearly distinct, suggesting that using only the average speed does not lead to a good model for predicting the effort zone.
+
+```{r}
+ggplot(filtered_df, aes(x = mean_speed, fill = factor(y))) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Distribution of Mean Speed", x = "Mean Speed", y = "Density") +
+  theme_minimal()
+```
+
+The second graph evaluates whether the model is able to effectively separate the two classes. The predicted scores for $y = 0$ and $y = 1$ do not overlap much, which means the model is effective in classifying the effort zones.
+
+```{r}
+filtered_df <- na.omit(filtered_df)
+ggplot(filtered_df, aes(x = predict(model_updated, type = "response"), fill = factor(y))) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Distribution of Predicted Scores", x = "Score", y = "Density") +
+  theme_minimal()
+
+```
+
+The third graph represents the ROC curve, which shows the model's ability to distinguish between the two zones. The curve approaches the top-left corner, indicating a good balance between true positives and false positives.
+
+The AUC (Area Under the Curve) = 0.8461 means that the model has good predictive power: this value suggests that the model is effective in distinguishing between the effort zones, although not perfect.
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+roc_curve <- roc(filtered_df$y, predict(model_updated, type = "response"))
+plot(roc_curve, main = "ROC curve", col = "blue")
+
+auc_value <- auc(filtered_df$y, predict(model_updated, type = "response"))
+
+```
+
+#### **Extension: Comparison between Zone-2, Zone-3, and Zone-4**
+
+To test whether the effort zones Zone-2, Zone-3, and Zone-4 are significantly different from each other in terms of characteristics extracted from speed and altitude, a pairwise comparison of the zones was chosen. For each combination, the same Friedman procedure used earlier is applied, and it is checked whether the null hypothesis (that the distributions across the different zones are the same) is rejected. If all null hypotheses are rejected, it means that the effort zones show significant differences in their characteristics. On the other hand, if the null hypotheses are not rejected, the data do not provide sufficient evidence to claim that the zones differ from each other.
+
+```{r warning=FALSE}
+
+# Zone 3 vs Zone 4 --------------------------------------------------------
+
+filtered_df1 <- subset(features_df, y %in% c("Zone-4", "Zone-3"))
+filtered_df1$y <- ifelse(filtered_df1$y == "Zone-4", 1, 0)
+model_updated1 <- glm(y ~ . - mean_altitude - total_elevation_gain, 
+                     data = filtered_df1, family = binomial())
+
+result_friedman1 <- simulate(filtered_df1[, -ncol(filtered_df1)], filtered_df1$y, model_updated1, P = 100)
+
+if (result_friedman1) {
+  cat("The test rejected H0: Significant difference between Zone-3 and Zone-4.\n")
+} else {
+  cat("The test did not reject H0: No significant difference between Zone-3 and Zone-4.\n")
+}
+
+# Zone 2 vs Zone 4 --------------------------------------------------------
+
+filtered_df2 <- subset(features_df, y %in% c("Zone-4", "Zone-2"))
+filtered_df2$y <- ifelse(filtered_df2$y == "Zone-4", 1, 0)
+model_updated2 <- glm(y ~ . - mean_altitude - total_elevation_gain, 
+                      data = filtered_df2, family = binomial())
+
+result_friedman2 <- simulate(filtered_df2[, -ncol(filtered_df2)], filtered_df2$y, model_updated2, P = 100)
+
+if (result_friedman2) {
+  cat("The test rejected H0: Significant difference between Zone-2 and Zone-4.\n")
+} else {
+  cat("The test did not reject H0: No significant difference between Zone-2 and Zone-4.\n")
+}
+
+```
+
+Since the test is rejected for all possible combinations, it can be concluded that the effort zones show significant differences in their characteristics.
+
+#### Conclusion
+
+In this study, we analyzed the performance of theoretical and practical classifiers on both simulated and real data through three main parts.
+
+In Part 1, we demonstrated that the decision tree outperformed the theoretically optimal Bayes classifier in terms of accuracy and stability, suggesting that flexible models can better adapt to the specific characteristics of given data-sets compared to theoretically ideal models.
+
+In Part 2, by applying the Friedman test with logistic regression, we studied how power and size vary with parameters such as sample size, number of variables, and distance between distributions, highlighting the importance of these factors in the design of statistical studies.
+
+In Part 3, we used the Friedman procedure to distinguish between heart rate effort zones using real data, showing statistically significant differences between the zones and confirming the effectiveness of the logistic regression model in distinguishing between them.
+
+This work highlights how practical models can sometimes surpass theoretical ones in applied contexts and demonstrates the utility of permutation-based testing procedures for comparing distributions and evaluating classifier performance in real-world scenarios.
